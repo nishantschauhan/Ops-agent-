@@ -1,0 +1,58 @@
+services:
+  # The whole environment. MCP's stdio transport is a direct parent<->child
+  # pipe, so in normal operation this single container's orchestrator spawns
+  # all three MCP servers itself as subprocesses (see agent/mcp_client.py) —
+  # that's what "3 standalone MCP servers + the agent" means at runtime.
+  app:
+    build: .
+    image: lieferblick-ops-agent:latest
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      DB_API_KEY: ${DB_API_KEY:-dev-db-key}
+      TICKETING_API_KEY: ${TICKETING_API_KEY:-dev-ticketing-key}
+      KB_API_KEY: ${KB_API_KEY:-dev-kb-key}
+    volumes:
+      - ./data:/app/data
+
+  # Standalone single-server services, for manually exercising one MCP
+  # server over stdio (debugging, or wiring a containerized MCP client at
+  # it directly). Not started by a plain `docker compose up`:
+  #   docker compose --profile debug run --rm db-server
+  db-server:
+    build: .
+    image: lieferblick-ops-agent:latest
+    command: python servers/mcp_database.py
+    environment:
+      DB_API_KEY: ${DB_API_KEY:-dev-db-key}
+    volumes:
+      - ./data:/app/data
+    stdin_open: true
+    tty: true
+    profiles: ["debug"]
+
+  ticketing-server:
+    build: .
+    image: lieferblick-ops-agent:latest
+    command: python servers/mcp_ticketing.py
+    environment:
+      TICKETING_API_KEY: ${TICKETING_API_KEY:-dev-ticketing-key}
+    volumes:
+      - ./data:/app/data
+    stdin_open: true
+    tty: true
+    profiles: ["debug"]
+
+  kb-server:
+    build: .
+    image: lieferblick-ops-agent:latest
+    command: python servers/mcp_knowledge.py
+    environment:
+      KB_API_KEY: ${KB_API_KEY:-dev-kb-key}
+    volumes:
+      - ./data:/app/data
+    stdin_open: true
+    tty: true
+    profiles: ["debug"]
