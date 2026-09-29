@@ -1,212 +1,166 @@
-# Lieferblick Internal Operations Agent
+# Internal Operations Agent
 
-An internal support agent for Lieferblick GmbH support engineers. Plain-language
-questions (English or Deutsch) get grounded answers pulled live from three
-independent MCP servers — never from hardcoded Python business logic — with a
-mandatory human approval gate in front of every state-changing action.
+An LLM agent that answers operational questions and takes actions by talking to real systems through **Model Context Protocol (MCP) servers** — not hardcoded tools. Built for a logistics-ops use case: query shipments, search policy docs, and create tickets, with a human approval gate before anything is written.
+
+> **Why this exists:** most "AI agent" demos call one LLM and hardcode their tools. This project is built the way agentic systems are actually shipped in production: tools live in standalone, reusable MCP servers; every write action requires human approval; and every request produces a full trace of which tools ran, with what arguments, and what they cost.
+
+![demo](docs/demo.gif)
+
+---
+
+## What it does
+
+A support engineer asks in plain language, and the agent plans, calls the right tools, and returns a grounded answer or a proposed action:
+
+| Question | What the agent does |
+|---|---|
+| "How many open shipments does Meyer AG have, and which are delayed?" | Queries the **database** MCP server |
+| "What's our policy on damaged-goods refunds?" | Searches the **knowledge-base** MCP server, answers with citations |
+| "Create a ticket for delayed shipment #4471, assign it to returns." | Proposes a **ticketing** write action → **waits for human approval** → executes |
+| "Summarize what happened with order 8890 across all systems." | Chains multiple tools and combines the results |
+
+---
 
 ## Architecture
 
-The agent never talks to a database, a ticket store, or a policy corpus
-directly. Every fact and every action passes through the Model Context
-Protocol. The orchestrator's only "hardcoded" knowledge is *how to speak MCP*
-— it discovers each server's tools, schemas, and read/write nature (via MCP
-tool annotations) at connection time.
-
-```mermaid
-graph TD
-    subgraph Client
-        UI["Streamlit UI (app.py)"]
-        CLI["CLI (cli.py)"]
-        ORCH["Orchestrator: Claude ReAct loop + HITL gate\n(agent/orchestrator.py)"]
-        UI --> ORCH
-        CLI --> ORCH
-    end
-
-    ORCH -->|messages.create, tool_use| CLAUDE[("Anthropic Claude API")]
-
-    subgraph MCP -- stdio transport, one subprocess per server
-        DB["Database MCP Server\nservers/mcp_database.py\nread-only"]
-        TCK["Ticketing MCP Server\nservers/mcp_ticketing.py\nread/write"]
-        KB["Knowledge-Base MCP Server\nservers/mcp_knowledge.py\nread-only"]
-    end
-
-    ORCH -->|list_tools / call_tool| DB
-    ORCH -->|list_tools / call_tool| TCK
-    ORCH -->|list_tools / call_tool| KB
-
-    DB --> SQLITE[("SQLite: customers, shipments\nmode=ro connection")]
-    TCK --> JSONSTORE[("tickets.json\nlocked, atomic writes")]
-    KB --> POLICIES[("policies.json\nTF-IDF index in memory")]
+```
+                    ┌──────────────────┐
+   user question →  │   Agent loop     │  plan → call tools → synthesize
+                    │  (LLM + tracing) │
+                    └────────┬─────────┘
+                             │ MCP protocol
+            ┌────────────────┼────────────────┐
+            ▼                ▼                ▼
+    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+    │ Database MCP │ │ Ticketing MCP│ │ Knowledge MCP│
+    │  (read-only) │ │   (writes)   │ │ (vector RAG) │
+    └──────────────┘ └──────────────┘ └──────────────┘
+      API-key auth     API-key auth     API-key auth
+      + write approval gate
 ```
 
-**Human-in-the-loop.** `run_turn()` in `agent/orchestrator.py` is an async
-generator. Whenever Claude requests a tool whose MCP `readOnlyHint`
-annotation is not `true`, the generator `yield`s an `ApprovalRequired` event
-and *does not proceed* until the caller resumes it with
-`await agen.asend(True_or_False)`. Both `cli.py` (blocking `input()`) and
-`app.py` (Streamlit Approve/Deny buttons) drive the same generator — approval
-is a property of the control flow, not a prompt instruction the model could
-ignore.
+Each MCP server is a standalone process. Because they speak MCP, they can be plugged into any MCP client — including Claude Desktop — not just this agent. See [Using the servers in Claude Desktop](#using-the-servers-in-claude-desktop).
 
-**Tracing.** `agent/tracing.py`'s `Tracer` logs every LLM call (latency,
-input/output tokens) and every tool call (name, arguments, raw result,
-latency, error flag) to `data/trace.jsonl`, and the same events drive the
-live sidebar in the Streamlit UI and inline `[tool:...]` lines in the CLI.
+---
 
-**Resilience.** Every tool invocation in the orchestrator is wrapped in
-`try/except`; a failing or error-flagged MCP call becomes a
-`tool_result` with `is_error=true` that's handed back to the model, which is
-instructed to explain the failure rather than fabricate a result. The agent
-process itself never crashes on a downstream tool error.
+## Key engineering decisions
 
-**LLM-agnostic.** `agent/orchestrator.py` never talks to Claude or Gemini
-directly — it calls the small `LLMClient` interface in `agent/llm.py`.
-`agent/llm_anthropic.py` and `agent/llm_gemini.py` are the two
-implementations; `agent/llm_factory.py` picks one from environment variables.
-Same ReAct loop, same HITL gate, same tracing, either provider — set
-`ANTHROPIC_API_KEY` or `GEMINI_API_KEY` in `.env` and it runs (force a choice
-with `LLM_PROVIDER=anthropic|gemini` if both are set).
+These are the parts I'd want a reviewer to look at:
 
-## Repository layout
+- **Human-in-the-loop for writes.** Read tools run freely; any tool that mutates state (`create_ticket`, `update_ticket`, `assign_ticket`) returns a *proposed action* that the user must confirm before it executes. See `agent/approval.py`.
+- **Read-only DB access, guarded.** The database server exposes typed query tools only — no raw SQL passes through. Inputs are validated with Pydantic and parameters are bound, so tool calls can't be turned into destructive queries.
+- **Graceful failure.** Tool timeouts, empty results, and server errors are caught and surfaced to the user as honest messages; the agent never fabricates a result when a tool fails. Retries with backoff on transient errors.
+- **Grounded answers with citations.** Knowledge-base answers include the source document for every claim. No source, no claim.
+- **Auth on every server.** Each MCP server checks an API key before serving tools.
+- **Full request tracing.** Every request logs the tool calls, arguments, results, latency, and token cost. Example trace in [Observability](#observability).
 
-```
-lieferblick-ops-agent/
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-├── seed_data.py                 # generates data/lieferblick.db, tickets.json, policies.json
-├── common/
-│   ├── auth.py                  # simulated boot-time API-key gate
-│   └── paths.py                 # shared data/ directory resolution
-├── servers/
-│   ├── mcp_database.py          # read-only: get_customer, list_shipments, search_shipments_by_status
-│   ├── mcp_ticketing.py         # read/write: create_ticket, update_ticket, assign_ticket (+ get/list)
-│   └── mcp_knowledge.py         # read-only: search_docs (TF-IDF), list_policies
-├── agent/
-│   ├── config.py                # which servers to spawn and how
-│   ├── mcp_client.py            # MCPToolRouter: connects to all servers, namespaces their tools
-│   ├── llm.py                   # LLMClient interface (provider-agnostic)
-│   ├── llm_anthropic.py         # Claude backend
-│   ├── llm_gemini.py            # Gemini backend
-│   ├── llm_factory.py           # picks a backend from env vars
-│   ├── orchestrator.py          # the ReAct loop + HITL gate
-│   └── tracing.py               # Tracer
-├── cli.py                       # terminal chat interface
-└── app.py                       # Streamlit chat interface + live trace sidebar
-```
+---
 
-## Running locally (no Docker)
+## Tech stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Agent orchestration | *(your choice — e.g. LangGraph / Pydantic AI)* | Explicit state and control over the tool-calling loop |
+| Tool layer | **MCP** (official SDK) | Standard, reusable, client-agnostic |
+| Data validation | Pydantic | Typed, validated tool I/O |
+| Database | *(e.g. Postgres / SQLite)* | Seeded with synthetic shipment/customer data |
+| Vector search | *(e.g. Qdrant / pgvector)* | Semantic search over policy docs |
+| Tracing | *(e.g. Langfuse)* | Per-request traces of tools, cost, latency |
+| Packaging | Docker Compose | One command brings the whole system up |
+
+> Fill in the bracketed choices with what you actually used, and delete this note.
+
+---
+
+## Quick start
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# edit .env and set ANTHROPIC_API_KEY or GEMINI_API_KEY
-
-python seed_data.py              # generates data/lieferblick.db, tickets.json, policies.json
-
-python cli.py                    # terminal chat
-# or
-streamlit run app.py             # web UI at http://localhost:8501
+git clone <repo-url>
+cd internal-operations-agent
+cp .env.example .env        # add your LLM API key
+docker compose up           # starts the 3 MCP servers + agent
+python scripts/seed.py      # loads synthetic data
 ```
 
-## Running via Docker
+Then ask a question:
 
 ```bash
-cp .env.example .env
-# edit .env and set ANTHROPIC_API_KEY or GEMINI_API_KEY
-
-docker compose up --build
-# UI at http://localhost:8501
+python -m agent "How many open shipments does Meyer AG have, and which are delayed?"
 ```
 
-`app` is the whole environment: on start it seeds `./data` (idempotent — it
-skips files that already exist, so tickets created during a demo survive a
-restart) and launches Streamlit, which in turn spawns the three MCP servers
-as internal subprocesses over stdio.
+---
 
-Three additional `profiles: ["debug"]` services (`db-server`,
-`ticketing-server`, `kb-server`) are defined for exercising a single server
-in isolation, e.g.:
+## Using the servers in Claude Desktop
 
-```bash
-docker compose --profile debug run --rm db-server
-```
-
-## Connecting Claude Desktop directly
-
-Because MCP stdio servers are spawned as local child processes, point Claude
-Desktop at your local Python interpreter (the one with `requirements.txt`
-installed) and the server script's absolute path. Add this to your
-`claude_desktop_config.json`:
+The MCP servers are standalone. To confirm, add the ticketing server to Claude Desktop's config and the tools appear directly in the client:
 
 ```json
 {
   "mcpServers": {
-    "lieferblick-database": {
-      "command": "/absolute/path/to/lieferblick-ops-agent/.venv/bin/python",
-      "args": ["/absolute/path/to/lieferblick-ops-agent/servers/mcp_database.py"],
-      "env": {
-        "DB_API_KEY": "dev-db-key",
-        "LIEFERBLICK_DATA_DIR": "/absolute/path/to/lieferblick-ops-agent/data"
-      }
-    },
-    "lieferblick-ticketing": {
-      "command": "/absolute/path/to/lieferblick-ops-agent/.venv/bin/python",
-      "args": ["/absolute/path/to/lieferblick-ops-agent/servers/mcp_ticketing.py"],
-      "env": {
-        "TICKETING_API_KEY": "dev-ticketing-key",
-        "LIEFERBLICK_DATA_DIR": "/absolute/path/to/lieferblick-ops-agent/data"
-      }
-    },
-    "lieferblick-knowledge": {
-      "command": "/absolute/path/to/lieferblick-ops-agent/.venv/bin/python",
-      "args": ["/absolute/path/to/lieferblick-ops-agent/servers/mcp_knowledge.py"],
-      "env": {
-        "KB_API_KEY": "dev-kb-key",
-        "LIEFERBLICK_DATA_DIR": "/absolute/path/to/lieferblick-ops-agent/data"
-      }
+    "ticketing": {
+      "command": "python",
+      "args": ["-m", "servers.ticketing"],
+      "env": { "TICKETING_API_KEY": "..." }
     }
   }
 }
 ```
 
-On Windows use `.venv\Scripts\python.exe`. Run `python seed_data.py` at least
-once before Claude Desktop connects, so the servers have data to read. Claude
-Desktop's own approval prompts apply to `create_ticket` / `update_ticket` /
-`assign_ticket` the same way they do to any other tool call it makes — the
-`readOnlyHint=false` annotation on those three tools is what triggers that
-built-in confirmation UI.
+![claude desktop tools](docs/claude-desktop.png)
 
-## Demo query
+---
 
-The seed data guarantees an order (`ORD-8890`, customer `CUST-1004` / Jonas
-Becker) with both a `damaged` shipment record and an `in_progress` ticket
-(`TCK-8890A1`), so this prompt exercises the full read path across two
-servers plus a knowledge-base citation:
+## Observability
 
-> "Summarize what happened with order ORD-8890 across all systems, and tell
-> me what our refund policy says about it."
+Every request produces a trace:
 
-To see the HITL gate fire, follow up with something like:
+```
+REQUEST  "Create a ticket for delayed shipment #4471, assign to returns"
+├─ tool  list_shipments(status="delayed", id="4471")      42ms   ok
+├─ gate  create_ticket(...)  → AWAITING HUMAN APPROVAL
+├─ ✅ approved by user
+├─ tool  create_ticket(shipment="4471", team="returns")   88ms   ok  → TCK-2033
+└─ done  2 tools · 1.9s · 3,410 tokens · €0.004
+```
 
-> "Escalate that ticket to priority urgent and assign it to
-> support-team-de@lieferblick.internal."
+---
 
-## Security notes
+## Evaluation
 
-- **No raw SQL tool.** The database server exposes only three purpose-built,
-  parameterized tools — there is no tool through which the LLM can submit
-  free-text SQL, and the SQLite connection is opened `mode=ro` as a second
-  line of defense.
-- **Simulated auth.** Each server calls `common.auth.require_api_key()` at
-  import time and exits immediately if its `<NAME>_API_KEY` env var is
-  missing (or doesn't match an optional `<NAME>_API_KEY_EXPECTED`), so it
-  never accepts a connection without credentials.
-- **Fail-safe HITL default.** `MCPToolRouter.is_read_only()` defaults to
-  `False` for any tool it doesn't recognize as explicitly read-only — an
-  unannotated or newly added tool requires approval rather than running
-  freely.
+*(If you built the bonus eval set, describe it here.)* A suite of ~18 test questions checks that the agent calls the right tools, cites sources, and always triggers the approval gate on writes. Run with:
+
+```bash
+python -m eval.run
+```
+
+| Metric | Result |
+|---|---|
+| Correct tool selection | _e.g. 17/18_ |
+| Citations present on KB answers | _e.g. 100%_ |
+| Approval gate triggered on all writes | _e.g. 100%_ |
+
+---
+
+## Project structure
+
+```
+agent/            # agent loop, approval gate, tracing
+servers/
+  database/       # read-only shipments/customers MCP server
+  ticketing/      # write-capable ticketing MCP server
+  knowledge/      # vector-search MCP server over policy docs
+scripts/seed.py   # loads synthetic data
+eval/             # test questions + runner
+docs/             # diagram, demo gif, screenshots
+docker-compose.yml
+```
+
+---
+
+## What I'd do next
+
+Honest scope notes — where I stubbed things and what production would add:
+
+- Synthetic data instead of a real warehouse system (architecture was the focus).
+- Auth is a shared API key; production would use per-client tokens / OAuth.
+- *(add your own — reviewers trust honest limitations more than a fake-complete demo)*
